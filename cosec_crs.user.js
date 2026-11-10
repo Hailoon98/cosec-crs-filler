@@ -1,12 +1,14 @@
 // ==UserScript==
 // @name         COSEC CRS Filler
 // @namespace    cosec
-// @version      2.7
+// @version      3.0
 // @description  Pick a case, press ONE button, the CRS form fills itself. You only click the blue Save buttons. Never submits.
 // @match        https://crs.ssm4u.com.my/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_registerMenuCommand
+// @grant        unsafeWindow
 // @connect      script.google.com
 // @connect      script.googleusercontent.com
 // @run-at       document-idle
@@ -20,7 +22,10 @@
   const ask = (k, msg) => { let v = GM_getValue(k, ''); if (!v) { v = (prompt(msg) || '').trim(); if (v) GM_setValue(k, v); } return v; };
   const API_URL = ask('api_url', 'COSEC: paste the API URL (from your admin)');
   const TOKEN   = ask('api_token', 'COSEC: paste the TOKEN (from your admin)');
-  window.cosecReset = () => { GM_setValue('api_url', ''); GM_setValue('api_token', ''); location.reload(); };
+  const reset = () => { GM_setValue('api_url', ''); GM_setValue('api_token', ''); location.reload(); };
+  window.cosecReset = reset;
+  try { unsafeWindow.cosecReset = reset; } catch (e) { /* console access only */ }
+  try { GM_registerMenuCommand('COSEC: change API URL / token', reset); } catch (e) { /* menu is optional */ }
 
   const FIXED = {
     nameSearch: { category: 'LOCAL COMPANY', type: 'S - LIMITED BY SHARES', sub: 'PRIVATE COMPANY', suffix: 'SDN. BHD.', application: 'PROPOSED COMPANY NAME' },
@@ -58,6 +63,16 @@
     return $$(root, sel).filter(e => vis(e) && re.test(labelOf(e)));
   }
   const readOnly = e => e.disabled || e.readOnly;
+  function inputByText(root, re) {                          // first editable input AFTER the first visible caption matching re
+    const caps = $$(root, '*').filter(e => e.children.length === 0 && re.test(txt(e)) && vis(e));
+    for (const c of caps) {
+      const i = $$(root, 'input,textarea').find(x => vis(x) && !readOnly(x) && x.type !== 'checkbox' && x.type !== 'radio' &&
+        (c.compareDocumentPosition(x) & Node.DOCUMENT_POSITION_FOLLOWING));
+      if (i) return i;
+    }
+    return null;
+  }
+  window.cosecDebug = () => console.log($$(document, 'input,select,textarea').filter(vis).map(e => [e.tagName, e.type, labelOf(e), e.value, e.disabled || e.readOnly].join(' | ')).join('\n'));
   function chooseOption(sel, want) {
     const w = U(want);
     const o = [...sel.options];
@@ -110,7 +125,7 @@
     return c.checked === want;
   }
   async function amountField(root, amount) {               // masked: needs real-looking typing
-    const f = fields(root, /Amount of Issued/i).find(e => !readOnly(e));
+    const f = fields(root, /Amount of Issued/i).find(e => !readOnly(e)) || inputByText(root, /Amount of Issued/i);
     if (!f) return mark(false, 'Amount of Issued Shares: field not found');
     const want = Number(amount).toFixed(4);
     for (const mode of ['exec', 'keys']) {
@@ -161,7 +176,14 @@
   }
   async function waitClosed(titleRe, what) {                // waits for the human to press the blue Save
     setStep(`👉 Check the form, then click the blue SAVE button (${what}). I will continue by myself.`);
-    for (let i = 0; i < 2000; i++) { if (!dialogRoot(titleRe)) return true; await sleep(500); }
+    for (let i = 0; i < 2000; i++) {
+      if (!dialogRoot(titleRe)) return true;
+      if (i % 6 === 5) {                                    // every 3 s: say WHY Save may be refused
+        const bad = $$(document, '*').filter(e => e.children.length === 0 && /is required|invalid/i.test(txt(e)) && vis(e)).map(e => txt(e).replace(/^Field\s+/i, '')).slice(0, 6);
+        if (bad.length) setStep(`👉 Cannot save yet - still required: ${[...new Set(bad)].join('; ')}. Fill by hand (or put it in corrected_value), then click SAVE.`);
+      }
+      await sleep(500);
+    }
     return false;
   }
   const clickBtn = re => { const b = $$(document, 'button').find(x => re.test(txt(x)) && vis(x)); if (b) b.click(); return !!b; };
@@ -251,13 +273,45 @@
     } else mark(false, 'Secretary residential address block not found');
   }
 
+  /* required value absent in the Sheet (MISSING rows are never sent) -> tell the human, never silently skip */
+  const need = (what, val) => { if (!String(val || '').trim()) mark(false, `${what}: MISSING in Sheet - type it in "corrected_value", or fill it by hand`); };
+
   async function shareholding(root, units, label) {
     check(root, /CASH/i, true);
-    await T(root, /Number of Unit/i, units, `${label} number of units`);
-    await sleep(300);
+    if (!/^\d+(\.\d+)?$/.test(String(units || '').trim()) || Number(units) <= 0) {
+      mark(false, `${label}: number of shares MISSING in Sheet - type it in "corrected_value" (Extract tab), or fill Number of Unit by hand. Amount left untouched.`);
+      return;                                                // never type 0.0000 into Amount: that is what made the form look stuck
+    }
+    const uf = fields(root, /Number of Unit/i).find(e => !readOnly(e)) || inputByText(root, /Number of Unit/i);
+    if (!uf) return mark(false, `${label}: "Number of Unit" box not found - run cosecDebug() in the console and send me the text`);
+    uf.scrollIntoView({ block: 'center' }); setText(uf, String(units).trim()); await sleep(400);
+    mark(uf.value.trim() === String(units).trim(), `${label} number of units: ${uf.value}`);
     await amountField(root, units);                         // amount = units x RM1
     const price = fields(root, /Price per Share/i)[0];
     if (price) mark(/^1(\.0+)?$/.test(price.value), `Price per share: ${price.value}`);
+  }
+
+  const COUNTRIES = ['SINGAPORE', 'CHINA', 'HONG KONG', 'TAIWAN', 'MALAYSIA', 'INDONESIA', 'THAILAND', 'VIETNAM', 'PHILIPPINES', 'INDIA', 'JAPAN', 'KOREA', 'UNITED KINGDOM', 'AUSTRALIA', 'UNITED STATES'];
+  async function residential(root, p, who) {                 // Local (Malaysia) or Foreign address, exactly as the client gave it
+    const addr = String(p.home_address_text || [p.addr_line1, p.addr_line2, p.addr_line3, p.postcode, p.city, p.state].filter(Boolean).join(', ')).trim();
+    if (!addr) return mark(false, `${who} residential address: MISSING in Sheet - type it in corrected_value (home_address_text), or fill by hand`);
+    const up = U(addr);
+    const country = U(p.country) || COUNTRIES.find(c => up.includes(c)) || U(p.nationality);
+    const local = country === 'MALAYSIA';
+    if (!radio(root, null, local ? /Local Address/i : /Foreign Address/i)) mark(false, `${who} residential: ${local ? 'Local' : 'Foreign'} Address option not found`);
+    await sleep(900);
+    if (local && p.addr_line1) {
+      [p.addr_line1, p.addr_line2, p.addr_line3].forEach((v, i) => { const l = $$(root, 'input[type=text]').filter(e => vis(e) && /Address Line/i.test(e.placeholder || ''))[i]; if (v && l) setText(l, v); });
+      await postcodeBlock(root, { postcode: p.postcode, city: p.city, state: p.state, country: 'MALAYSIA' }, 0);
+    } else if (local) {
+      mark(false, `${who} residential (Malaysia): split address (lines/postcode/city/state) not in Sheet - fill by hand: ${addr.slice(0, 60)}`);
+    } else {
+      const ls = splitAddress(addr, 3);
+      const fa = $$(root, 'input[type=text]').filter(e => vis(e) && !readOnly(e) && /Foreign (Residential )?Address/i.test(labelOf(e)));
+      ls.forEach((v, i) => { if (v && fa[i]) setText(fa[i], v); });
+      mark(!!fa[0], `${who} foreign residential address lines` + (fa.length < 3 ? ' (only ' + fa.length + ' box(es) found)' : ''));
+      await S(root, /^Country$/i, country, `${who} address country`, -1);
+    }
   }
 
   async function fillPerson(root, p, asMember) {
@@ -276,7 +330,9 @@
     await S(root, /^Race$/i, p.race, 'Race');
     await T(root, /Phone No/i, (p.phone || '').replace(/[^\d]/g, ''), 'Phone');
     await T(root, /^Email$/i, p.email, 'Email');
-    mark(true, 'Residential address left blank (house rule)');
+    [['Name', p.full_name], ['ID number', p.id_number], ['Date of birth', p.dob], ['Gender', p.gender], ['Nationality', p.nationality], ['Race', p.race], ['Phone', p.phone], ['Email', p.email]].forEach(([w, v]) => need((asMember ? 'Member ' : 'Director ') + w, v));
+    await S(root, /^Citizenship$/i, p.citizenship, 'Citizenship');
+    await residential(root, p, asMember ? 'Member' : 'Director');
   }
 
   async function addDirector(p) {
@@ -329,6 +385,7 @@
       mark(!!fa[0], 'Foreign address lines' + (fa.length < 3 ? ' (only ' + fa.length + ' box(es) found)' : ''));
       await S(root, /^Country$/i, k.place_of_incorporation, 'Address country', -1);
     }
+    [['Entity No.', k.entity_no], ['Date of incorporation', k.incorporation_date], ['Place of incorporation', k.place_of_incorporation], ['Entity email', k.email || k.rep_email], ['Registered office', k.registered_office], ['Representative name', k.rep_name], ['Representative ID no.', k.rep_id_number], ['Representative designation', k.rep_designation]].forEach(([w, v]) => need('Company shareholder ' + w, v));
     await shareholding(root, k.units, 'Company shareholder');
     await T(root, /Name of Person/i, k.rep_name, 'Representative name');
     await S(root, /Identification Type/i, k.rep_id_type || 'FOREIGNER NATIONAL ID', 'Representative ID type', 0);
@@ -422,7 +479,7 @@
     try {
       const r = await api('list');
       if (!r.ok) return setStep('Sheet error: ' + r.error);
-      CASES = r.cases; setStep(CASES.length + ' case(s) not yet Entered.');
+      CASES = r.cases.filter(c => !/^(Delete|Entered|Archived)$/i.test(c.status || '')); setStep(CASES.length + ' case(s) not yet Entered.');
       const last = GM_getValue('last_case', ''); if (last && !CUR && CASES.some(c => c.id === last)) { CUR = last; render(); pickCase(last); }
     } catch (e) { setStep(e.message); }
   }
