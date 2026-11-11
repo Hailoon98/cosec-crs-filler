@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         COSEC CRS Filler
 // @namespace    cosec
-// @version      3.0
+// @version      3.1
 // @description  Pick a case, press ONE button, the CRS form fills itself. You only click the blue Save buttons. Never submits.
 // @match        https://crs.ssm4u.com.my/*
 // @grant        GM_xmlhttpRequest
@@ -88,7 +88,8 @@
   async function T(root, re, val, what, idx) {            // fill text field by label
     val = String(val == null ? '' : val);
     if (!val) return;
-    const f = fields(root, re)[idx || 0];
+    let f = fields(root, re)[idx || 0];
+    for (let i = 0; i < 32 && !f; i++) { await sleep(250); f = fields(root, re)[idx || 0]; }   // v3.1: CRS renders late
     if (!f) return mark(false, `${what}: field not found`);
     if (readOnly(f)) return mark(true, `${what}: locked by CRS (${f.value})`);
     setText(f, val); await sleep(150);
@@ -96,8 +97,9 @@
   }
   async function S(root, re, val, what, idx) {            // fill select by label
     if (!val) return;
-    const arr = fields(root, re, 'select');
-    let f = (idx || 0) < 0 ? arr.filter(x => !readOnly(x)).slice(idx)[0] : arr[idx || 0];
+    const pick = () => { const arr = fields(root, re, 'select'); return (idx || 0) < 0 ? arr.filter(x => !readOnly(x)).slice(idx)[0] : arr[idx || 0]; };
+    let f = pick();
+    for (let i = 0; i < 32 && !f; i++) { await sleep(250); f = pick(); }                      // v3.1: CRS renders late
     for (let i = 0; i < 10 && f && f.options.length < 2; i++) { await sleep(400); }
     if (!f) return mark(false, `${what}: dropdown not found`);
     if (readOnly(f)) return mark(true, `${what}: locked by CRS`);
@@ -174,6 +176,14 @@
     for (let i = 0; i < 40; i++) { const d = dialogRoot(titleRe); if (open ? d : !d) return d || true; await sleep(300); }
     return null;
   }
+  /* v3.1: the dialog title shows before its fields. Wait (max 30 s) until test(root) is true; return a FRESH root. */
+  async function waitReady(titleRe, test, ms) {
+    for (let i = 0; i < (ms || 30000) / 250; i++) { const d = dialogRoot(titleRe); if (d && test(d)) return d; await sleep(250); }
+    return dialogRoot(titleRe);
+  }
+  const hasIdType = r => fields(r, /^Identification Type$/i, 'select').some(e => !readOnly(e));
+  const hasRadios = r => $$(r, 'input[type=radio]').filter(x => vis(x.parentElement)).length >= 2;
+  async function waitFor(fn, ms) { for (let i = 0; i < (ms || 8000) / 250 && !fn(); i++) await sleep(250); }
   async function waitClosed(titleRe, what) {                // waits for the human to press the blue Save
     setStep(`👉 Check the form, then click the blue SAVE button (${what}). I will continue by myself.`);
     for (let i = 0; i < 2000; i++) {
@@ -318,6 +328,7 @@
     const idt = U(p.id_type || (/^[STFG]\d{7}[A-Z]$/i.test(p.id_number || '') ? 'FOREIGNER NATIONAL ID' : 'MYKAD'));
     await S(root, /^Identification Type$/i, idt, 'ID type');
     await sleep(500);
+    await waitFor(() => fields(root, /^Identification No\.?$/i).length && fields(root, /^Name \(as per/i).length);   // v3.1
     await T(root, /^Identification No\.?$/i, p.id_number, 'ID number');
     await sleep(900);
     await S(root, /Secondary Identification Type/i, 'PASSPORT', 'Secondary ID type');
@@ -337,9 +348,10 @@
 
   async function addDirector(p) {
     if (!clickBtn(/Add Director/i)) return mark(false, 'Add Director button not found');
-    const root = await waitDialog(/^Director Details$/, true);
+    let root = await waitDialog(/^Director Details$/, true);
     if (!root) return mark(false, 'Director dialog did not open');
     await sleep(600);
+    root = await waitReady(/^Director Details$/, hasIdType) || root;                     // v3.1
     setStep(`Director: ${p.full_name}…`);
     const alsoMember = rolesOf(p).includes('shareholder') || U(p.units) !== '';
     if (alsoMember && rolesOf(p).includes('shareholder')) check(root, /MEMBER/i, true);
@@ -350,11 +362,13 @@
 
   async function addMemberPerson(p) {
     if (!clickBtn(/Add Member/i)) return mark(false, 'Add Member button not found');
-    const root = await waitDialog(/^Member Details$/, true);
+    let root = await waitDialog(/^Member Details$/, true);
     if (!root) return mark(false, 'Member dialog did not open');
     await sleep(600);
     setStep(`Member: ${p.full_name}…`);
+    root = await waitReady(/^Member Details$/, hasRadios) || root;                        // v3.1
     radio(root, /Type of Member/i, /INDIVIDUAL/i); await sleep(500);
+    root = await waitReady(/^Member Details$/, hasIdType) || root;                        // v3.1
     await fillPerson(root, p, true);
     await shareholding(root, p.units, 'Member');
     await waitClosed(/^Member Details$/, 'Member ' + p.full_name);
@@ -362,13 +376,16 @@
 
   async function addMemberCorp(k) {
     if (!clickBtn(/Add Member/i)) return mark(false, 'Add Member button not found');
-    const root = await waitDialog(/^Member Details$/, true);
+    let root = await waitDialog(/^Member Details$/, true);
     if (!root) return mark(false, 'Member dialog did not open');
     await sleep(600);
     setStep(`Company shareholder: ${k.entity_name}…`);
+    root = await waitReady(/^Member Details$/, hasRadios) || root;                        // v3.1
     radio(root, /Type of Member/i, /BODY CORPORATE/i); await sleep(600);
     const my = isMalaysianCo(k.entity_name);
+    root = await waitReady(/^Member Details$/, r => $$(r, 'label,span,div,p,h4,h5').some(e => e.children.length <= 1 && /Registered with SSM/i.test(txt(e)) && vis(e))) || root;   // v3.1
     radio(root, /Registered with SSM/i, my ? /^Yes$/i : /^No$/i); await sleep(600);
+    root = await waitReady(/^Member Details$/, r => fields(r, /Entity No/i).length > 0) || root;   // v3.1
     await S(root, /Category of Member/i, k.category || (my ? '' : 'FOREIGN ENTITY NOT REGISTERED WITH SSM'), 'Category');
     await T(root, /Entity No/i, k.entity_no, 'Entity No.');
     if (my) mark(false, 'Malaysian company: click the Search button next to Entity No. yourself, then press Fill everything again if fields stay empty');
@@ -387,6 +404,7 @@
     }
     [['Entity No.', k.entity_no], ['Date of incorporation', k.incorporation_date], ['Place of incorporation', k.place_of_incorporation], ['Entity email', k.email || k.rep_email], ['Registered office', k.registered_office], ['Representative name', k.rep_name], ['Representative ID no.', k.rep_id_number], ['Representative designation', k.rep_designation]].forEach(([w, v]) => need('Company shareholder ' + w, v));
     await shareholding(root, k.units, 'Company shareholder');
+    await waitFor(() => fields(root, /Name of Person/i).length && fields(root, /Identification Type/i, 'select').length, 30000);   // v3.1
     await T(root, /Name of Person/i, k.rep_name, 'Representative name');
     await S(root, /Identification Type/i, k.rep_id_type || 'FOREIGNER NATIONAL ID', 'Representative ID type', 0);
     await T(root, /Identification No/i, k.rep_id_number, 'Representative ID number');
