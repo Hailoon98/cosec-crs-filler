@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         COSEC CRS Filler
 // @namespace    cosec
-// @version      3.1
+// @version      3.2
 // @description  Pick a case, press ONE button, the CRS form fills itself. You only click the blue Save buttons. Never submits.
 // @match        https://crs.ssm4u.com.my/*
 // @grant        GM_xmlhttpRequest
@@ -106,19 +106,31 @@
     mark(chooseOption(f, val), `${what}: ${val}`);
     await sleep(250);
   }
-  function radio(root, questionRe, answerRe) {            // radio (optionally inside a question block)
+  function radioEl(root, questionRe, answerRe) {           // the radio input itself (or null)
     let scope = root;
     if (questionRe) {
       const q = $$(root, 'label,span,div,p,h4,h5').find(e => e.children.length <= 1 && questionRe.test(txt(e)) && vis(e));
-      if (!q) return false;
+      if (!q) return null;
       let c = q;
       for (let i = 0; i < 6 && c && $$(c, 'input[type=radio]').length < 2; i++) c = c.parentElement;
       scope = c || root;
     }
-    const r = $$(scope, 'input[type=radio]').find(x => answerRe.test(txt(x.parentElement)) && vis(x.parentElement));
+    return $$(scope, 'input[type=radio]').find(x => answerRe.test(txt(x.parentElement)) && vis(x.parentElement)) || null;
+  }
+  function radio(root, questionRe, answerRe) {            // radio (optionally inside a question block)
+    const r = radioEl(root, questionRe, answerRe);
     if (!r) return false;
     if (!r.checked) r.click();
     return true;
+  }
+  async function radioVerified(root, questionRe, answerRe, what) {   // click, then CHECK it really is selected; retry twice
+    for (let i = 0; i < 3; i++) {
+      const r = radioEl(root, questionRe, answerRe);
+      if (r) { if (!r.checked) { r.click(); ev(r, ['input', 'change']); } await sleep(500); if (radioEl(root, questionRe, answerRe)?.checked) return true; }
+      else await sleep(500);
+    }
+    mark(false, `${what}: could not be selected - choose it by hand, then press Fill everything again`);
+    return false;
   }
   function check(root, re, want) {                         // checkbox by its own text
     const c = $$(root, 'input[type=checkbox]').find(x => re.test(txt(x.parentElement) || labelOf(x)));
@@ -154,8 +166,16 @@
   let CASES = [], CUR = null, DATA = null, BUSY = false, STEP = '';
 
   const stripSuffix = n => String(n || '').replace(/\s*(SDN\.?\s*BHD\.?|SENDIRIAN\s+BERHAD)\s*$/i, '').trim();
+  const CJK = /[\u3000-\u303f\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af\uff00-\uffef]/;
+  function englishOnly(t) {                                // CRS addresses: English only. Drop Chinese + the bracket that held it
+    t = String(t || '');
+    if (!CJK.test(t)) return t;
+    const c = t.replace(/[(（\[【][^)）\]】]*[)）\]】]/g, m => CJK.test(m) ? '' : m).replace(new RegExp(CJK.source, 'g'), ' ')
+      .replace(/\s+/g, ' ').replace(/\s+,/g, ',').replace(/\s*,\s*(,\s*)+/g, ', ').replace(/\(\s*\)|\[\s*\]/g, '').replace(/^[\s,;-]+|[\s,;-]+$/g, '');
+    return (c.match(/[A-Za-z]/g) || []).length >= 6 ? c : t;
+  }
   function splitAddress(s, n) {                            // text -> up to n lines, overflow merged into the last
-    const parts = String(s || '').split(/\s*[\n,]\s*/).filter(Boolean);
+    const parts = englishOnly(s).split(/\s*[\n,]\s*/).filter(Boolean);
     const out = parts.length > n ? parts.slice(0, n - 1).concat([parts.slice(n - 1).join(', ')]) : parts.slice();
     while (out.length < n) out.push('');
     return out;
@@ -220,6 +240,15 @@
     setStep('👉 Check Name Search, then click the green SEARCH button yourself. After the form opens, press “Fill everything”.');
   }
 
+  async function codeInList(code, waitMs) {               // true once the code shows in a TABLE row (the added list)
+    const num = String(code).replace(/\D/g, '').slice(0, 5) || String(code).trim();
+    for (let t = 0; ; t += 500) {
+      if (num && $$(document, 'table').some(tb => (tb.innerText || '').includes(num))) return true;
+      if (t >= waitMs) return false;
+      await sleep(500);
+    }
+  }
+
   async function fillCompanyDetails() {
     const c = DATA.company, R = FIXED.regAddr, root = document;
     setStep('Company Details…');
@@ -237,7 +266,10 @@
           inputs = fields(root, /Business Code/i); box = inputs.find(i => !i.value);
         }
         if (!box) { mark(false, `Business code ${code}: no empty box (add it by hand)`); continue; }
-        setText(box, code.trim()); await sleep(500);
+        setText(box, code.trim());
+        let ok = await codeInList(code, 3000);                // typed but never added to the list below? retype once, wait longer
+        if (!ok) { setText(box, ''); await sleep(400); setText(box, code.trim()); ok = await codeInList(code, 5000); }
+        if (!ok) { mark(false, `Business code ${code}: typed but NOT added to the list - pick it from the suggestion by hand`); continue; }
         mark(true, `Business code: ${code}`);
       }
     } else mark(false, 'Business code: field not found');
@@ -367,7 +399,8 @@
     await sleep(600);
     setStep(`Member: ${p.full_name}…`);
     root = await waitReady(/^Member Details$/, hasRadios) || root;                        // v3.1
-    radio(root, /Type of Member/i, /INDIVIDUAL/i); await sleep(500);
+    if (!await radioVerified(root, /Type of Member/i, /INDIVIDUAL/i, 'Type of Member = Individual')) return;
+    await sleep(300);
     root = await waitReady(/^Member Details$/, hasIdType) || root;                        // v3.1
     await fillPerson(root, p, true);
     await shareholding(root, p.units, 'Member');
@@ -381,7 +414,8 @@
     await sleep(600);
     setStep(`Company shareholder: ${k.entity_name}…`);
     root = await waitReady(/^Member Details$/, hasRadios) || root;                        // v3.1
-    radio(root, /Type of Member/i, /BODY CORPORATE/i); await sleep(600);
+    if (!await radioVerified(root, /Type of Member/i, /BODY CORPORATE|CORPORATE|COMPANY|ENTITY/i, 'Type of Member = Company')) return;
+    await sleep(300);
     const my = isMalaysianCo(k.entity_name);
     root = await waitReady(/^Member Details$/, r => $$(r, 'label,span,div,p,h4,h5').some(e => e.children.length <= 1 && /Registered with SSM/i.test(txt(e)) && vis(e))) || root;   // v3.1
     radio(root, /Registered with SSM/i, my ? /^Yes$/i : /^No$/i); await sleep(600);
@@ -406,7 +440,10 @@
     await shareholding(root, k.units, 'Company shareholder');
     await waitFor(() => fields(root, /Name of Person/i).length && fields(root, /Identification Type/i, 'select').length, 30000);   // v3.1
     await T(root, /Name of Person/i, k.rep_name, 'Representative name');
-    await S(root, /Identification Type/i, k.rep_id_type || 'FOREIGNER NATIONAL ID', 'Representative ID type', 0);
+    let repType = U(k.rep_id_type || '');                      // CRS offers only MYKAD and FOREIGNER NATIONAL ID (no passport)
+    if (!repType) { const same = Object.values(DATA.persons).find(p => p.full_name && U(p.full_name) === U(k.rep_name)); if (same) repType = U(same.id_type || ''); }
+    if (repType === 'MYKAD' || repType === 'FOREIGNER NATIONAL ID') await S(root, /Identification Type/i, repType, 'Representative ID type', 0);
+    else mark(false, 'Representative ID type: not decided' + (repType ? ' (' + repType + ' is not a CRS option)' : ' (nationality unknown, or passport only)') + ' - choose it by hand. Ask the client for a national ID / MyKad if there is none.');
     await T(root, /Identification No/i, k.rep_id_number, 'Representative ID number');
     await S(root, /Designation/i, (k.rep_designation || 'DIRECTOR').toUpperCase(), 'Representative designation');
     await waitClosed(/^Member Details$/, 'Company shareholder');
