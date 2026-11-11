@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         COSEC CRS Filler
 // @namespace    cosec
-// @version      3.2
+// @version      3.3
 // @description  Pick a case, press ONE button, the CRS form fills itself. You only click the blue Save buttons. Never submits.
 // @match        https://crs.ssm4u.com.my/*
 // @grant        GM_xmlhttpRequest
@@ -440,9 +440,9 @@
     await shareholding(root, k.units, 'Company shareholder');
     await waitFor(() => fields(root, /Name of Person/i).length && fields(root, /Identification Type/i, 'select').length, 30000);   // v3.1
     await T(root, /Name of Person/i, k.rep_name, 'Representative name');
-    let repType = U(k.rep_id_type || '');                      // CRS offers only MYKAD and FOREIGNER NATIONAL ID (no passport)
+    let repType = U(k.rep_id_type || '');                      // CRS list: FOREIGNER NATIONAL ID, MYKAD, MYKAS, MYPR, MYTENTERA (no passport)
     if (!repType) { const same = Object.values(DATA.persons).find(p => p.full_name && U(p.full_name) === U(k.rep_name)); if (same) repType = U(same.id_type || ''); }
-    if (repType === 'MYKAD' || repType === 'FOREIGNER NATIONAL ID') await S(root, /Identification Type/i, repType, 'Representative ID type', 0);
+    if (['MYKAD', 'FOREIGNER NATIONAL ID', 'MYKAS', 'MYPR', 'MYTENTERA'].includes(repType)) await S(root, /Identification Type/i, repType, 'Representative ID type', 0);
     else mark(false, 'Representative ID type: not decided' + (repType ? ' (' + repType + ' is not a CRS option)' : ' (nationality unknown, or passport only)') + ' - choose it by hand. Ask the client for a national ID / MyKad if there is none.');
     await T(root, /Identification No/i, k.rep_id_number, 'Representative ID number');
     await S(root, /Designation/i, (k.rep_designation || 'DIRECTOR').toUpperCase(), 'Representative designation');
